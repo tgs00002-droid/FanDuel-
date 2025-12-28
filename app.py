@@ -3,6 +3,7 @@ import time
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -18,12 +19,14 @@ API_HOST = "https://api.the-odds-api.com"
 SPORT_KEY = "basketball_nba"
 
 DB_PATH = "odds_history.sqlite"
-CACHE_TTL_SECONDS = 30          # frequent enough to see changes, but not too costly
-DEFAULT_REFRESH_SECONDS = 60    # suggested "check for changes" interval
+CACHE_TTL_SECONDS = 30          # frequent enough to observe changes; protect credits
+DEFAULT_REFRESH_SECONDS = 60    # suggested polling interval
+
+ET = ZoneInfo("US/Eastern")
 
 
 # =========================
-# UTILS
+# TIME HELPERS
 # =========================
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -31,12 +34,26 @@ def utc_now() -> datetime:
 def utc_now_iso() -> str:
     return utc_now().isoformat(timespec="seconds")
 
+def utc_to_et(ts: pd.Timestamp) -> pd.Timestamp:
+    if ts is None or pd.isna(ts):
+        return ts
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    return ts.astimezone(ET)
+
+def format_et(ts: pd.Timestamp) -> str:
+    return ts.strftime("%Y-%m-%d %I:%M %p ET")
+
 def safe_get_secret(name: str) -> Optional[str]:
     try:
         return st.secrets.get(name)
     except Exception:
         return None
 
+
+# =========================
+# ODDS MATH
+# =========================
 def american_to_prob(odds: Any) -> float:
     if odds is None:
         return np.nan
@@ -102,7 +119,6 @@ def init_db() -> None:
         con.execute("CREATE INDEX IF NOT EXISTS idx_event_market ON odds_snapshots(event_id, market, outcome);")
         con.execute("CREATE INDEX IF NOT EXISTS idx_captured ON odds_snapshots(captured_at);")
 
-
 def save_snapshot_long(rows: List[Dict[str, Any]]) -> None:
     if not rows:
         return
@@ -130,7 +146,6 @@ def save_snapshot_long(rows: List[Dict[str, Any]]) -> None:
             ],
         )
 
-
 def read_history(event_id: str, market: str, outcome: str, book: Optional[str] = None, limit: int = 5000) -> pd.DataFrame:
     q = """
     SELECT captured_at, book, price, point
@@ -148,22 +163,18 @@ def read_history(event_id: str, market: str, outcome: str, book: Optional[str] =
 
     with db_conn() as con:
         df = pd.read_sql_query(q, con, params=params)
+
     if df.empty:
         return df
+
     df["captured_at"] = pd.to_datetime(df["captured_at"], utc=True, errors="coerce")
     return df
 
-
 def last_change_time(df_hist: pd.DataFrame) -> Optional[pd.Timestamp]:
-    """
-    Return the timestamp where price/point last changed (compared to previous record).
-    """
     if df_hist is None or df_hist.empty:
         return None
-    # define a "value" signature
     sig = df_hist[["price", "point"]].astype(float).round(6)
     changed = (sig != sig.shift(1)).any(axis=1)
-    # ignore first row
     changed.iloc[0] = False
     if not changed.any():
         return None
@@ -188,12 +199,7 @@ def fetch_odds(api_key: str, regions: str, markets: str, odds_format: str) -> Li
         raise RuntimeError(f"API error {r.status_code}: {r.text[:500]}")
     return r.json()
 
-
 def event_to_long_rows(event: Dict[str, Any], captured_at_iso: str) -> List[Dict[str, Any]]:
-    """
-    Turn one event into long rows for DB storage.
-    We store price/point for each (book, market, outcome).
-    """
     out = []
     event_id = event.get("id")
     commence_time = event.get("commence_time")
@@ -224,7 +230,7 @@ def event_to_long_rows(event: Dict[str, Any], captured_at_iso: str) -> List[Dict
 
 
 # =========================
-# BOARD LOGIC (CLEAN SUMMARY)
+# BOARD BUILDING
 # =========================
 def best_price(series: pd.Series) -> float:
     s = pd.to_numeric(series, errors="coerce")
@@ -240,17 +246,13 @@ def best_books(df: pd.DataFrame, col: str, best_val: float) -> str:
     return ", ".join(books[:2]) + ("…" if len(books) > 2 else "")
 
 def make_clean_board(events: List[Dict[str, Any]]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Returns:
-      - best_lines: one row per game (clean, user-friendly)
-      - per_book: per-book table for selected matchup
-    """
     per_book_rows = []
     for e in events:
         event_id = e.get("id")
         home = e.get("home_team")
         away = e.get("away_team")
         start = e.get("commence_time")
+
         for b in e.get("bookmakers", []) or []:
             book = b.get("title") or b.get("key")
             markets = {m.get("key"): m for m in (b.get("markets") or [])}
@@ -338,21 +340,23 @@ st.set_page_config(page_title="NBA Odds Board", layout="wide")
 init_db()
 
 st.title("NBA Live Odds Board")
-st.caption(f"Last refresh (UTC): {utc_now_iso()}  •  Source: The Odds API")
+
+refresh_et = format_et(utc_to_et(pd.Timestamp.utcnow().tz_localize("UTC")))
+st.caption(f"Last refresh (ET): {refresh_et}  •  Source: The Odds API")
 
 st.markdown(
     """
 **How to read this:**
-- **Best Line** = most favorable odds across sportsbooks.
-- **Market Win %** includes sportsbook margin (vig).
-- **Fair Win %** removes vig to estimate a fair probability.
-- **Sportsbook Margin %** (lower is better).
+- **Best Line** is the most favorable moneyline available across sportsbooks.
+- **Market Win %** includes sportsbook margin.
+- **Fair Win %** removes margin to estimate a fair probability.
+- **Sportsbook Margin %** is an approximation of market cost (lower is better).
 """
 )
 
 api_key = safe_get_secret("ODDS_API_KEY") or os.getenv("ODDS_API_KEY")
 if not api_key:
-    st.error("Missing ODDS_API_KEY. Add it to Streamlit → Settings → Secrets.")
+    st.error("Missing ODDS_API_KEY. Add it to Streamlit Settings → Secrets.")
     st.stop()
 
 with st.sidebar:
@@ -363,11 +367,7 @@ with st.sidebar:
     with st.expander("Advanced"):
         odds_format = st.selectbox("Odds format", ["american", "decimal"], index=0)
         poll_seconds = st.slider("Auto-refresh (seconds)", 15, 180, DEFAULT_REFRESH_SECONDS, 5)
-        force_refresh = st.button("Force refresh now")
-
-# Optional auto-refresh (lightweight)
-st.write(f"✅ API key loaded: **True**")
-st.caption("Tip: The app records a timestamped snapshot each refresh so you can see when odds changed.")
+        force_refresh = st.button("Force refresh")
 
 if force_refresh:
     fetch_odds.clear()
@@ -386,128 +386,141 @@ except Exception as e:
     st.stop()
 
 if not events:
-    st.warning("0 games returned. If it’s offseason or no games today, that’s normal.")
+    st.warning("No games returned. This is normal if there are no NBA games scheduled right now.")
     st.stop()
 
 # Save snapshot to DB
-captured_at = utc_now_iso()
+captured_at_iso = utc_now_iso()
 long_rows = []
 for ev in events:
-    long_rows.extend(event_to_long_rows(ev, captured_at))
+    long_rows.extend(event_to_long_rows(ev, captured_at_iso))
 save_snapshot_long(long_rows)
 
-# Build cleaner tables
 best_lines, per_book = make_clean_board(events)
 
-tabs = st.tabs(["🏀 Best Lines (Simple)", "📈 Line Movement (When odds changed)", "📚 What these metrics mean"])
+# Convert game start times to ET and drop UTC columns for display
+best_lines["Start (ET)"] = best_lines["Start (UTC)"].apply(utc_to_et).apply(format_et)
+best_lines = best_lines.drop(columns=["Start (UTC)"])
 
-# ---------------- Tab 1: Simple board
+per_book["Start (ET)"] = per_book["Start (UTC)"].apply(utc_to_et).apply(format_et)
+per_book = per_book.drop(columns=["Start (UTC)"])
+
+# Round percentages for readability
+for c in ["Market Win % (Away)", "Market Win % (Home)", "Fair Win % (Away)", "Fair Win % (Home)", "Sportsbook Margin %"]:
+    if c in best_lines.columns:
+        best_lines[c] = best_lines[c].round(2)
+
+tabs = st.tabs(["Best Lines", "Line Movement", "Definitions"])
+
+# =========================
+# TAB 1: BEST LINES
+# =========================
 with tabs[0]:
-    st.subheader("Best Line (Simple view)")
+    st.subheader("Best Lines (Simplified)")
 
-    # Clean formatting
-    show = best_lines.copy()
-    for c in ["Market Win % (Away)", "Market Win % (Home)", "Fair Win % (Away)", "Fair Win % (Home)", "Sportsbook Margin %"]:
-        show[c] = show[c].round(2)
-
-    # Quick insight
     avg_margin = float(np.nanmean(best_lines["Sportsbook Margin %"])) if best_lines["Sportsbook Margin %"].notna().any() else np.nan
     if not np.isnan(avg_margin):
-        st.info(f"💡 Average sportsbook margin across games: **{avg_margin:.2f}%** (lower is better).")
+        st.info(f"Average sportsbook margin across games: {avg_margin:.2f}%.")
 
-    st.dataframe(show, use_container_width=True)
+    cols = [
+        "Start (ET)",
+        "Matchup",
+        "Best Away ML",
+        "Best Away Book",
+        "Best Home ML",
+        "Best Home Book",
+        "Market Win % (Away)",
+        "Market Win % (Home)",
+        "Fair Win % (Away)",
+        "Fair Win % (Home)",
+        "Sportsbook Margin %",
+    ]
+    cols = [c for c in cols if c in best_lines.columns]
+    st.dataframe(best_lines[cols], use_container_width=True)
 
-    st.caption("If this feels too dense, use the Line Movement tab and pick ONE game + ONE market.")
-
-# ---------------- Tab 2: Line movement
+# =========================
+# TAB 2: LINE MOVEMENT
+# =========================
 with tabs[1]:
     st.subheader("Line Movement (with timestamps)")
 
     matchups = best_lines["Matchup"].tolist()
-    matchup = st.selectbox("Choose a matchup", matchups, index=0)
+    matchup = st.selectbox("Matchup", matchups, index=0)
 
-    # Find event_id
     eid = best_lines.loc[best_lines["Matchup"] == matchup, "Event ID"].iloc[0]
 
-    colA, colB, colC = st.columns([1.2, 1.0, 1.0])
+    row = per_book.loc[per_book["Event ID"] == eid].iloc[0]
+    away = row["Away"]
+    home = row["Home"]
 
-    with colA:
+    c1, c2, c3 = st.columns([1.2, 1.0, 1.0])
+    with c1:
         market = st.selectbox("Market", ["h2h", "spreads", "totals"], index=0)
-    with colB:
-        # outcome choices depend on market
-        # read teams from per_book
-        row = per_book.loc[per_book["Event ID"] == eid].iloc[0]
-        away = row["Away"]
-        home = row["Home"]
-        if market == "h2h":
-            outcome = st.selectbox("Outcome", [away, home], index=0)
-        elif market == "spreads":
+    with c2:
+        if market in ["h2h", "spreads"]:
             outcome = st.selectbox("Outcome", [away, home], index=0)
         else:
             outcome = st.selectbox("Outcome", ["Over", "Under"], index=0)
-    with colC:
-        # optional book filter
+    with c3:
         books = sorted(per_book.loc[per_book["Event ID"] == eid, "Book"].astype(str).unique().tolist())
-        book = st.selectbox("Book (optional)", ["All books"] + books, index=0)
-        book_filter = None if book == "All books" else book
+        book_choice = st.selectbox("Book", ["Best across books"] + books, index=0)
+        book_filter = None if book_choice == "Best across books" else book_choice
 
     hist = read_history(event_id=eid, market=market, outcome=outcome, book=book_filter)
 
     if hist.empty:
-        st.warning("No history yet for that selection. Click Force refresh a couple times to record snapshots.")
+        st.warning("No history available yet. Use Force refresh a few times to record snapshots.")
     else:
-        # If All books, show best price at each timestamp (max price)
         if book_filter is None:
-            # collapse by timestamp -> best price
             h = hist.groupby("captured_at", as_index=False).agg({"price": "max", "point": "max"})
-            h["book"] = "Best across books"
         else:
             h = hist.copy()
 
-        # last change time
-        lct = last_change_time(h.rename(columns={"captured_at": "captured_at"}))
+        lct = last_change_time(h)
         if lct is None:
-            st.success("No odds changes detected yet (based on your saved snapshots).")
+            st.info("No odds changes detected yet based on saved snapshots.")
         else:
-            st.info(f"🕒 Last changed at: **{lct.strftime('%Y-%m-%d %H:%M:%S UTC')}**")
+            st.info(f"Last changed at: {format_et(utc_to_et(lct))}.")
 
-        # chart y-axis
-        y_col = "price" if market != "spreads" else "price"
+        # Plot price movement (American odds)
         fig = px.line(h, x="captured_at", y="price", markers=True)
+        fig.update_layout(xaxis_title="Time (UTC stored, displayed in ET below)", yaxis_title="Price")
         st.plotly_chart(fig, use_container_width=True)
 
-        if market in ["spreads", "totals"]:
-            # also plot point if available
-            if h["point"].notna().any():
-                fig2 = px.line(h, x="captured_at", y="point", markers=True)
-                st.plotly_chart(fig2, use_container_width=True)
+        # Plot point movement if applicable
+        if market in ["spreads", "totals"] and h["point"].notna().any():
+            fig2 = px.line(h, x="captured_at", y="point", markers=True)
+            fig2.update_layout(xaxis_title="Time (UTC stored, displayed in ET below)", yaxis_title="Point")
+            st.plotly_chart(fig2, use_container_width=True)
 
-        # show raw history
+        # Display table with ET times
         disp = h.copy()
-        disp["captured_at"] = disp["captured_at"].dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+        disp["captured_at"] = disp["captured_at"].apply(utc_to_et).apply(format_et)
         disp["price"] = disp["price"].apply(fmt_american)
         st.dataframe(disp, use_container_width=True)
 
-# ---------------- Tab 3: explainers
+# =========================
+# TAB 3: DEFINITIONS
+# =========================
 with tabs[2]:
     st.markdown(
         """
-### What these metrics mean (plain English)
+### Definitions
 
-**Moneyline (ML)**  
-Just “who wins”. Odds show payout.
+**Moneyline (h2h)**  
+Odds for which team wins the game.
 
 **Market Win %**  
-Probability implied by the odds, **including** sportsbook margin (vig).
+Implied probability from the displayed odds, including sportsbook margin.
 
 **Fair Win % (No-Vig)**  
-We normalize both sides so they sum to 100%. This removes vig and gives a fairer probability estimate.
+Win probability estimate after removing sportsbook margin.
 
 **Sportsbook Margin % (Hold)**  
-How much the sportsbook is taking in the market.  
-Lower margin usually means better pricing for bettors.
+An approximation of sportsbook margin for the moneyline market. Lower typically means better pricing.
 
-### Why timestamps matter
-We save snapshots each refresh. Odds only “change” when a new snapshot differs from the previous one.
+### About timestamps
+The app saves a snapshot each refresh with a timestamp.  
+An "odds change" is detected when a new snapshot differs from the prior snapshot for the selected market/outcome.
 """
     )
