@@ -19,7 +19,7 @@ API_HOST = "https://api.the-odds-api.com"
 SPORT_KEY = "basketball_nba"
 
 DB_PATH = "odds_history.sqlite"
-CACHE_TTL_SECONDS = 30          # frequent enough to observe changes; protect credits
+CACHE_TTL_SECONDS = 30          # frequent enough to observe changes; protects credits
 DEFAULT_REFRESH_SECONDS = 60    # suggested polling interval
 
 ET = ZoneInfo("US/Eastern")
@@ -35,6 +35,7 @@ def utc_now_iso() -> str:
     return utc_now().isoformat(timespec="seconds")
 
 def utc_to_et(ts: pd.Timestamp) -> pd.Timestamp:
+    """Convert a pandas Timestamp to Eastern Time."""
     if ts is None or pd.isna(ts):
         return ts
     if ts.tzinfo is None:
@@ -42,6 +43,7 @@ def utc_to_et(ts: pd.Timestamp) -> pd.Timestamp:
     return ts.astimezone(ET)
 
 def format_et(ts: pd.Timestamp) -> str:
+    """Format ET timestamp as readable string."""
     return ts.strftime("%Y-%m-%d %I:%M %p ET")
 
 def safe_get_secret(name: str) -> Optional[str]:
@@ -341,7 +343,8 @@ init_db()
 
 st.title("NBA Live Odds Board")
 
-refresh_et = format_et(utc_to_et(pd.Timestamp.utcnow().tz_localize("UTC")))
+# FIXED: do not tz_localize() a tz-aware timestamp
+refresh_et = format_et(pd.Timestamp.utcnow().tz_convert("US/Eastern"))
 st.caption(f"Last refresh (ET): {refresh_et}  •  Source: The Odds API")
 
 st.markdown(
@@ -482,18 +485,15 @@ with tabs[1]:
         else:
             st.info(f"Last changed at: {format_et(utc_to_et(lct))}.")
 
-        # Plot price movement (American odds)
         fig = px.line(h, x="captured_at", y="price", markers=True)
-        fig.update_layout(xaxis_title="Time (UTC stored, displayed in ET below)", yaxis_title="Price")
+        fig.update_layout(xaxis_title="Captured time (stored in UTC)", yaxis_title="Price")
         st.plotly_chart(fig, use_container_width=True)
 
-        # Plot point movement if applicable
         if market in ["spreads", "totals"] and h["point"].notna().any():
             fig2 = px.line(h, x="captured_at", y="point", markers=True)
-            fig2.update_layout(xaxis_title="Time (UTC stored, displayed in ET below)", yaxis_title="Point")
+            fig2.update_layout(xaxis_title="Captured time (stored in UTC)", yaxis_title="Point")
             st.plotly_chart(fig2, use_container_width=True)
 
-        # Display table with ET times
         disp = h.copy()
         disp["captured_at"] = disp["captured_at"].apply(utc_to_et).apply(format_et)
         disp["price"] = disp["price"].apply(fmt_american)
@@ -520,7 +520,7 @@ Win probability estimate after removing sportsbook margin.
 An approximation of sportsbook margin for the moneyline market. Lower typically means better pricing.
 
 ### About timestamps
-The app saves a snapshot each refresh with a timestamp.  
+The app saves a snapshot each refresh with a timestamp.
 An "odds change" is detected when a new snapshot differs from the prior snapshot for the selected market/outcome.
 """
     )
