@@ -1,5 +1,4 @@
 import os
-import time
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -19,8 +18,8 @@ API_HOST = "https://api.the-odds-api.com"
 SPORT_KEY = "basketball_nba"
 
 DB_PATH = "odds_history.sqlite"
-CACHE_TTL_SECONDS = 30          # frequent enough to observe changes; protects credits
-DEFAULT_REFRESH_SECONDS = 60    # suggested polling interval
+CACHE_TTL_SECONDS = 30
+DEFAULT_REFRESH_SECONDS = 60
 
 ET = ZoneInfo("US/Eastern")
 
@@ -31,20 +30,22 @@ ET = ZoneInfo("US/Eastern")
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
+
 def utc_now_iso() -> str:
     return utc_now().isoformat(timespec="seconds")
 
+
 def utc_to_et(ts: pd.Timestamp) -> pd.Timestamp:
-    """Convert a pandas Timestamp to Eastern Time."""
     if ts is None or pd.isna(ts):
         return ts
     if ts.tzinfo is None:
         ts = ts.tz_localize("UTC")
     return ts.astimezone(ET)
 
+
 def format_et(ts: pd.Timestamp) -> str:
-    """Format ET timestamp as readable string."""
     return ts.strftime("%Y-%m-%d %I:%M %p ET")
+
 
 def safe_get_secret(name: str) -> Optional[str]:
     try:
@@ -69,12 +70,14 @@ def american_to_prob(odds: Any) -> float:
         return (-o) / ((-o) + 100.0)
     return np.nan
 
+
 def no_vig_two_way(p1: float, p2: float) -> Tuple[float, float, float]:
     if any(np.isnan([p1, p2])) or p1 <= 0 or p2 <= 0:
         return np.nan, np.nan, np.nan
     hold = (p1 + p2) - 1.0
     denom = p1 + p2
     return p1 / denom, p2 / denom, hold
+
 
 def fmt_american(x: Any) -> str:
     if x is None or (isinstance(x, float) and np.isnan(x)):
@@ -84,6 +87,7 @@ def fmt_american(x: Any) -> str:
     except Exception:
         return str(x)
     return f"+{x}" if x > 0 else str(x)
+
 
 def to_float(x: Any) -> float:
     try:
@@ -97,6 +101,7 @@ def to_float(x: Any) -> float:
 # =========================
 def db_conn() -> sqlite3.Connection:
     return sqlite3.connect(DB_PATH, check_same_thread=False)
+
 
 def init_db() -> None:
     with db_conn() as con:
@@ -120,6 +125,7 @@ def init_db() -> None:
         con.execute("CREATE INDEX IF NOT EXISTS idx_event ON odds_snapshots(event_id);")
         con.execute("CREATE INDEX IF NOT EXISTS idx_event_market ON odds_snapshots(event_id, market, outcome);")
         con.execute("CREATE INDEX IF NOT EXISTS idx_captured ON odds_snapshots(captured_at);")
+
 
 def save_snapshot_long(rows: List[Dict[str, Any]]) -> None:
     if not rows:
@@ -148,6 +154,7 @@ def save_snapshot_long(rows: List[Dict[str, Any]]) -> None:
             ],
         )
 
+
 def read_history(event_id: str, market: str, outcome: str, book: Optional[str] = None, limit: int = 5000) -> pd.DataFrame:
     q = """
     SELECT captured_at, book, price, point
@@ -170,7 +177,9 @@ def read_history(event_id: str, market: str, outcome: str, book: Optional[str] =
         return df
 
     df["captured_at"] = pd.to_datetime(df["captured_at"], utc=True, errors="coerce")
+    df["captured_at_et"] = df["captured_at"].apply(utc_to_et)
     return df
+
 
 def last_change_time(df_hist: pd.DataFrame) -> Optional[pd.Timestamp]:
     if df_hist is None or df_hist.empty:
@@ -200,6 +209,7 @@ def fetch_odds(api_key: str, regions: str, markets: str, odds_format: str) -> Li
     if r.status_code != 200:
         raise RuntimeError(f"API error {r.status_code}: {r.text[:500]}")
     return r.json()
+
 
 def event_to_long_rows(event: Dict[str, Any], captured_at_iso: str) -> List[Dict[str, Any]]:
     out = []
@@ -240,12 +250,14 @@ def best_price(series: pd.Series) -> float:
         return np.nan
     return s.max()
 
+
 def best_books(df: pd.DataFrame, col: str, best_val: float) -> str:
     if np.isnan(best_val) or df.empty:
         return ""
     s = pd.to_numeric(df[col], errors="coerce")
     books = df.loc[s == best_val, "Book"].astype(str).unique().tolist()
     return ", ".join(books[:2]) + ("…" if len(books) > 2 else "")
+
 
 def make_clean_board(events: List[Dict[str, Any]]) -> Tuple[pd.DataFrame, pd.DataFrame]:
     per_book_rows = []
@@ -343,17 +355,14 @@ init_db()
 
 st.title("NBA Live Odds Board")
 
-# FIXED: do not tz_localize() a tz-aware timestamp
+# Do not tz_localize on tz-aware Timestamp
 refresh_et = format_et(pd.Timestamp.utcnow().tz_convert("US/Eastern"))
 st.caption(f"Last refresh (ET): {refresh_et}  •  Source: The Odds API")
 
 st.markdown(
     """
-**How to read this:**
-- **Best Line** is the most favorable moneyline available across sportsbooks.
-- **Market Win %** includes sportsbook margin.
-- **Fair Win %** removes margin to estimate a fair probability.
-- **Sportsbook Margin %** is an approximation of market cost (lower is better).
+This dashboard aggregates live NBA odds across sportsbooks and tracks line movement over time.
+All displayed times are Eastern Time.
 """
 )
 
@@ -369,10 +378,10 @@ with st.sidebar:
 
     with st.expander("Advanced"):
         odds_format = st.selectbox("Odds format", ["american", "decimal"], index=0)
-        poll_seconds = st.slider("Auto-refresh (seconds)", 15, 180, DEFAULT_REFRESH_SECONDS, 5)
+        _poll_seconds = st.slider("Auto-refresh (seconds)", 15, 180, DEFAULT_REFRESH_SECONDS, 5)
         force_refresh = st.button("Force refresh")
 
-if force_refresh:
+if "force_refresh" in locals() and force_refresh:
     fetch_odds.clear()
 
 # Fetch odds
@@ -389,12 +398,12 @@ except Exception as e:
     st.stop()
 
 if not events:
-    st.warning("No games returned. This is normal if there are no NBA games scheduled right now.")
+    st.warning("No games returned. This can happen if there are no NBA games scheduled right now.")
     st.stop()
 
 # Save snapshot to DB
 captured_at_iso = utc_now_iso()
-long_rows = []
+long_rows: List[Dict[str, Any]] = []
 for ev in events:
     long_rows.extend(event_to_long_rows(ev, captured_at_iso))
 save_snapshot_long(long_rows)
@@ -442,7 +451,7 @@ with tabs[0]:
     st.dataframe(best_lines[cols], use_container_width=True)
 
 # =========================
-# TAB 2: LINE MOVEMENT
+# TAB 2: LINE MOVEMENT (PLOTLY IN ET)
 # =========================
 with tabs[1]:
     st.subheader("Line Movement (with timestamps)")
@@ -476,28 +485,47 @@ with tabs[1]:
     else:
         if book_filter is None:
             h = hist.groupby("captured_at", as_index=False).agg({"price": "max", "point": "max"})
+            h["captured_at_et"] = h["captured_at"].apply(utc_to_et)
         else:
             h = hist.copy()
 
-        lct = last_change_time(h)
+        lct = last_change_time(h.rename(columns={"captured_at": "captured_at", "price": "price", "point": "point"}))
         if lct is None:
             st.info("No odds changes detected yet based on saved snapshots.")
         else:
             st.info(f"Last changed at: {format_et(utc_to_et(lct))}.")
 
-        fig = px.line(h, x="captured_at", y="price", markers=True)
-        fig.update_layout(xaxis_title="Captured time (stored in UTC)", yaxis_title="Price")
+        # Plotly x-axis uses Eastern Time
+        fig = px.line(
+            h,
+            x="captured_at_et",
+            y="price",
+            markers=True,
+            labels={"captured_at_et": "Time (ET)", "price": "Price"},
+            title=None,
+        )
+        fig.update_layout(xaxis_title="Time (ET)", yaxis_title="Odds Price")
         st.plotly_chart(fig, use_container_width=True)
 
         if market in ["spreads", "totals"] and h["point"].notna().any():
-            fig2 = px.line(h, x="captured_at", y="point", markers=True)
-            fig2.update_layout(xaxis_title="Captured time (stored in UTC)", yaxis_title="Point")
+            fig2 = px.line(
+                h,
+                x="captured_at_et",
+                y="point",
+                markers=True,
+                labels={"captured_at_et": "Time (ET)", "point": "Point"},
+                title=None,
+            )
+            fig2.update_layout(xaxis_title="Time (ET)", yaxis_title="Line / Total")
             st.plotly_chart(fig2, use_container_width=True)
 
         disp = h.copy()
-        disp["captured_at"] = disp["captured_at"].apply(utc_to_et).apply(format_et)
-        disp["price"] = disp["price"].apply(fmt_american)
-        st.dataframe(disp, use_container_width=True)
+        disp["Time (ET)"] = disp["captured_at_et"].apply(format_et)
+        disp["Odds"] = disp["price"].apply(fmt_american)
+        cols_show = ["Time (ET)", "Odds"]
+        if market in ["spreads", "totals"] and disp["point"].notna().any():
+            cols_show.append("point")
+        st.dataframe(disp[cols_show], use_container_width=True)
 
 # =========================
 # TAB 3: DEFINITIONS
@@ -521,6 +549,6 @@ An approximation of sportsbook margin for the moneyline market. Lower typically 
 
 ### About timestamps
 The app saves a snapshot each refresh with a timestamp.
-An "odds change" is detected when a new snapshot differs from the prior snapshot for the selected market/outcome.
+An odds change is detected when a new snapshot differs from the prior snapshot for the selected market/outcome.
 """
     )
